@@ -41,22 +41,68 @@ MAX_ALLOWED     = 2 * 1024 * 1024 * 1024
 ALLOWED_SCHEMES = {"http", "https"}
 BLOCKED_HOSTS   = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
-YDL_BASE = {
-    "quiet": True,
-    "no_warnings": True,
-    "skip_download": True,
-    "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+# Multiple client strategies to bypass YouTube blocking
+YDL_STRATEGIES = [
+    # Strategy 1: TV client (most reliable, bypasses age/bot checks)
+    {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["tv_embedded"],
+                "skip": ["dash", "hls"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1",
+        },
+        "socket_timeout": 30,
     },
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["web", "android"],
-        }
+    # Strategy 2: Android client
+    {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip",
+        },
+        "socket_timeout": 30,
     },
-    "socket_timeout": 30,
-}
+    # Strategy 3: Web with cookies bypass
+    {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web_creator", "web"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        "socket_timeout": 30,
+    },
+    # Strategy 4: iOS client
+    {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios"],
+            }
+        },
+        "socket_timeout": 30,
+    },
+]
 
 def validate_url(url: str) -> str:
     url = url.strip()
@@ -111,7 +157,6 @@ def build_formats(info):
         if label in seen_labels:
             continue
         seen_labels.add(label)
-
         best = None
         best_tbr = 0
         for f in raw_formats:
@@ -120,9 +165,7 @@ def build_formats(info):
                 if tbr > best_tbr:
                     best_tbr = tbr
                     best = f
-
         if best:
-            fid = best.get("format_id", "best")
             filesize = best.get("filesize") or best.get("filesize_approx") or 0
             formats.append({
                 "format_id": f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={h}]+bestaudio/best[height<={h}]",
@@ -133,28 +176,20 @@ def build_formats(info):
                 "height": h,
             })
 
-    audio_formats = []
-    for f in raw_formats:
-        vcodec = f.get("vcodec", "none")
-        acodec = f.get("acodec", "none")
-        if vcodec == "none" and acodec != "none":
-            abr = int(f.get("abr") or 0)
-            if abr > 0:
-                audio_formats.append((abr, f.get("format_id", "bestaudio")))
-
     seen_abr = set()
-    for abr, fid in sorted(audio_formats, reverse=True):
-        if abr in seen_abr:
-            continue
-        seen_abr.add(abr)
-        formats.append({
-            "format_id": "bestaudio/best",
-            "label": f"🎵 Audio Only — {abr}kbps MP3",
-            "ext": "mp3",
-            "filesize": 0,
-            "filesize_human": "Unknown",
-            "height": 0,
-        })
+    for f in raw_formats:
+        if f.get("vcodec", "none") == "none" and f.get("acodec", "none") != "none":
+            abr = int(f.get("abr") or 0)
+            if abr > 0 and abr not in seen_abr:
+                seen_abr.add(abr)
+                formats.append({
+                    "format_id": "bestaudio/best",
+                    "label": f"🎵 Audio Only — {abr}kbps MP3",
+                    "ext": "mp3",
+                    "filesize": 0,
+                    "filesize_human": "Unknown",
+                    "height": 0,
+                })
 
     formats.insert(0, {
         "format_id": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
@@ -170,24 +205,20 @@ def build_formats(info):
 
 class InfoRequest(BaseModel):
     url: str
-
     @validator("url")
     def url_not_empty(cls, v):
         if not v or not v.strip():
             raise ValueError("URL is required.")
         return v.strip()
-
 
 class DownloadRequest(BaseModel):
     url: str
     format_id: str = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-
     @validator("url")
     def url_not_empty(cls, v):
         if not v or not v.strip():
             raise ValueError("URL is required.")
         return v.strip()
-
     @validator("format_id")
     def safe_format(cls, v):
         if len(v) > 300:
@@ -209,43 +240,41 @@ async def health():
 async def get_info(request: Request, body: InfoRequest):
     url = validate_url(body.url)
 
-    try:
-        opts = {**YDL_BASE}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+    # Try multiple strategies for yt-dlp
+    last_error = None
+    for i, strategy in enumerate(YDL_STRATEGIES):
+        try:
+            logger.info(f"Trying strategy {i+1} for {url}")
+            with yt_dlp.YoutubeDL(strategy) as ydl:
+                info = ydl.extract_info(url, download=False)
 
-        formats = build_formats(info)
-        total_size = info.get("filesize") or info.get("filesize_approx") or 0
-        large = total_size > SIZE_THRESHOLD
+            formats = build_formats(info)
+            total_size = info.get("filesize") or info.get("filesize_approx") or 0
+            large = total_size > SIZE_THRESHOLD
 
-        return {
-            "type": "media",
-            "title": info.get("title", "Unknown"),
-            "thumbnail": info.get("thumbnail"),
-            "duration": info.get("duration"),
-            "uploader": info.get("uploader"),
-            "formats": formats,
-            "filesize": total_size,
-            "filesize_human": format_bytes(total_size),
-            "large_file": large,
-            "large_warning": f"Large file ({format_bytes(total_size)}) — your browser will download this directly" if large else None,
-        }
+            return {
+                "type": "media",
+                "title": info.get("title", "Unknown"),
+                "thumbnail": info.get("thumbnail"),
+                "duration": info.get("duration"),
+                "uploader": info.get("uploader"),
+                "formats": formats,
+                "filesize": total_size,
+                "filesize_human": format_bytes(total_size),
+                "large_file": large,
+                "large_warning": f"Large file ({format_bytes(total_size)}) — your browser will download this directly" if large else None,
+            }
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"Strategy {i+1} failed: {e}")
+            continue
 
-    except yt_dlp.utils.DownloadError as e:
-        err = str(e).lower()
-        if any(x in err for x in ["sign in", "login", "private", "removed", "unavailable", "blocked"]):
-            raise HTTPException(status_code=400, detail="This video is private, removed, or requires login.")
-        pass
-    except Exception as e:
-        logger.error(f"yt-dlp error: {e}")
-        pass
-
+    # All strategies failed — try direct file
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
             head = await client.head(url)
             content_length = int(head.headers.get("content-length", 0))
-            content_type   = head.headers.get("content-type", "application/octet-stream")
-            final_url      = str(head.url)
+            final_url = str(head.url)
 
         if content_length > MAX_ALLOWED:
             raise HTTPException(status_code=400, detail="File exceeds 2 GB limit.")
@@ -254,26 +283,16 @@ async def get_info(request: Request, body: InfoRequest):
         filename = final_url.split("/")[-1].split("?")[0] or "download"
         ext = filename.split(".")[-1] if "." in filename else "file"
 
-        if ext in ["mp4", "mkv", "avi", "mov", "webm"]:
-            icon = "🎬"; label = f"Video File ({ext.upper()})"
-        elif ext in ["mp3", "m4a", "wav", "flac", "aac"]:
-            icon = "🎵"; label = f"Audio File ({ext.upper()})"
-        elif ext in ["zip", "rar", "7z", "tar", "gz"]:
-            icon = "📦"; label = f"Archive ({ext.upper()})"
-        else:
-            icon = "📁"; label = f"File ({ext.upper()})"
+        if ext in ["mp4","mkv","avi","mov","webm"]: label = f"Video File ({ext.upper()})"
+        elif ext in ["mp3","m4a","wav","flac","aac"]: label = f"Audio File ({ext.upper()})"
+        elif ext in ["zip","rar","7z","tar","gz"]: label = f"Archive ({ext.upper()})"
+        else: label = f"File ({ext.upper()})"
 
         return {
             "type": "direct",
             "title": filename,
             "thumbnail": None,
-            "formats": [{
-                "format_id": "direct",
-                "label": f"⬇️ {label} — {format_bytes(content_length)}",
-                "ext": ext,
-                "filesize": content_length,
-                "filesize_human": format_bytes(content_length),
-            }],
+            "formats": [{"format_id": "direct", "label": f"⬇️ {label} — {format_bytes(content_length)}", "ext": ext, "filesize": content_length, "filesize_human": format_bytes(content_length)}],
             "filesize": content_length,
             "filesize_human": format_bytes(content_length),
             "large_file": large,
@@ -283,79 +302,77 @@ async def get_info(request: Request, body: InfoRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Direct file error | {e}")
-        raise HTTPException(status_code=400, detail="Could not fetch info. Please check the link and try again.")
+        logger.error(f"All strategies failed: {last_error}")
+        raise HTTPException(status_code=400, detail="Could not fetch video info. The video may be unavailable or region-locked.")
 
 
 @app.post("/download")
 @limiter.limit("10/minute")
 async def download(request: Request, body: DownloadRequest):
-    url       = validate_url(body.url)
+    url = validate_url(body.url)
     format_id = body.format_id
 
     if format_id == "direct":
         return JSONResponse({"redirect": url})
 
-    tmp_dir = "/tmp"
-    ydl_opts = {
-        **YDL_BASE,
-        "skip_download": False,
-        "format": format_id,
-        "outtmpl": f"{tmp_dir}/zapload_%(id)s.%(ext)s",
-        "merge_output_format": "mp4",
-        "postprocessors": [{
-            "key": "FFmpegVideoConvertor",
-            "preferedformat": "mp4",
-        }],
-    }
-
-    try:
-        import subprocess
-        subprocess.run(["aria2c", "--version"], capture_output=True, check=True)
-        ydl_opts["external_downloader"] = "aria2c"
-        ydl_opts["external_downloader_args"] = ["-x", "16", "-s", "16", "-k", "1M"]
-    except Exception:
-        pass
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info     = ydl.extract_info(url, download=True)
-            filepath = ydl.prepare_filename(info)
-            if not os.path.exists(filepath):
-                base = filepath.rsplit(".", 1)[0]
-                for ext in ["mp4", "mkv", "webm", "mp3", "m4a"]:
-                    candidate = f"{base}.{ext}"
-                    if os.path.exists(candidate):
-                        filepath = candidate
-                        break
-
-        if not os.path.exists(filepath):
-            raise HTTPException(status_code=500, detail="Download failed.")
-
-        filesize = os.path.getsize(filepath)
-        if filesize > SIZE_THRESHOLD:
-            os.remove(filepath)
-            return JSONResponse({"redirect": url})
-
-        filename = os.path.basename(filepath)
-
-        def iterfile():
-            with open(filepath, "rb") as f:
-                while chunk := f.read(1024 * 1024):
-                    yield chunk
+    last_error = None
+    for i, strategy in enumerate(YDL_STRATEGIES):
+        try:
+            ydl_opts = {
+                **strategy,
+                "skip_download": False,
+                "format": format_id,
+                "outtmpl": f"/tmp/zapload_%(id)s.%(ext)s",
+                "merge_output_format": "mp4",
+                "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
+            }
             try:
-                os.remove(filepath)
+                import subprocess
+                subprocess.run(["aria2c", "--version"], capture_output=True, check=True)
+                ydl_opts["external_downloader"] = "aria2c"
+                ydl_opts["external_downloader_args"] = ["-x", "16", "-s", "16", "-k", "1M"]
             except Exception:
                 pass
 
-        return StreamingResponse(
-            iterfile(),
-            media_type="application/octet-stream",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-        )
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filepath = ydl.prepare_filename(info)
+                if not os.path.exists(filepath):
+                    base = filepath.rsplit(".", 1)[0]
+                    for ext in ["mp4", "mkv", "webm", "mp3", "m4a"]:
+                        candidate = f"{base}.{ext}"
+                        if os.path.exists(candidate):
+                            filepath = candidate
+                            break
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Download error | {e}")
-        raise HTTPException(status_code=500, detail="Download failed. Please try again.")
+            if not os.path.exists(filepath):
+                continue
+
+            filesize = os.path.getsize(filepath)
+            if filesize > SIZE_THRESHOLD:
+                os.remove(filepath)
+                return JSONResponse({"redirect": url})
+
+            filename = os.path.basename(filepath)
+
+            def iterfile():
+                with open(filepath, "rb") as f:
+                    while chunk := f.read(1024 * 1024):
+                        yield chunk
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
+
+            return StreamingResponse(
+                iterfile(),
+                media_type="application/octet-stream",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+            )
+
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"Download strategy {i+1} failed: {e}")
+            continue
+
+    raise HTTPException(status_code=500, detail="Download failed. Please try again.")
