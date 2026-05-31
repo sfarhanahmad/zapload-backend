@@ -1,7 +1,6 @@
 import os
 import re
 import logging
-import subprocess
 import httpx
 from datetime import datetime
 from urllib.parse import urlparse
@@ -15,78 +14,160 @@ from slowapi.errors import RateLimitExceeded
 from pydantic import BaseModel, validator
 import yt_dlp
 
-# ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("zapload")
 
-# ── Rate limiter ──────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address)
-
-# ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="ZapLoad API", docs_url=None, redoc_url=None)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# ── CORS (update ALLOWED_ORIGIN in .env for production) ──────────────────────
-ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[ALLOWED_ORIGIN],
-    allow_methods=["GET", "POST"],
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# ── Security headers middleware ───────────────────────────────────────────────
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["X-Powered-By-Hidden"] = ""
     return response
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-MAX_SERVER_BYTES   = 500 * 1024 * 1024   # 500 MB  → stream through server
-MAX_ALLOWED_BYTES  = 2  * 1024 * 1024 * 1024  # 2 GB hard cap
-SIZE_THRESHOLD     = 500 * 1024 * 1024   # same as MAX_SERVER_BYTES
+SIZE_THRESHOLD  = 500 * 1024 * 1024
+MAX_ALLOWED     = 2 * 1024 * 1024 * 1024
+ALLOWED_SCHEMES = {"http", "https"}
+BLOCKED_HOSTS   = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
-ALLOWED_SCHEMES    = {"http", "https"}
-BLOCKED_HOSTS      = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+YDL_BASE = {
+    "quiet": True,
+    "no_warnings": True,
+    "skip_download": True,
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    },
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["web", "android"],
+        }
+    },
+    "socket_timeout": 30,
+}
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 def validate_url(url: str) -> str:
-    """Strict URL validation — raises HTTPException on failure."""
     url = url.strip()
     try:
         parsed = urlparse(url)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid URL.")
-
     if parsed.scheme not in ALLOWED_SCHEMES:
         raise HTTPException(status_code=400, detail="Invalid URL.")
     if not parsed.netloc:
         raise HTTPException(status_code=400, detail="Invalid URL.")
     if parsed.hostname in BLOCKED_HOSTS:
         raise HTTPException(status_code=400, detail="Invalid URL.")
-    # Block private IP ranges
     if re.match(r"^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)", parsed.hostname or ""):
         raise HTTPException(status_code=400, detail="Invalid URL.")
     return url
 
-
-def format_bytes(b: int) -> str:
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
+def format_bytes(b):
+    if not b:
+        return "Unknown"
+    for unit in ["B", "KB", "MB", "GB"]:
         if b < 1024:
             return f"{b:.1f} {unit}"
         b /= 1024
-    return f"{b:.1f} PB"
+    return f"{b:.1f} TB"
+
+def build_formats(info):
+    formats = []
+    seen_labels = set()
+    raw_formats = info.get("formats") or []
+
+    heights = set()
+    for f in raw_formats:
+        h = f.get("height")
+        vcodec = f.get("vcodec", "none")
+        if h and vcodec != "none" and h >= 144:
+            heights.add(h)
+
+    quality_labels = {
+        2160: "4K (2160p)",
+        1440: "1440p (2K)",
+        1080: "1080p Full HD",
+        720:  "720p HD",
+        480:  "480p",
+        360:  "360p",
+        240:  "240p",
+        144:  "144p",
+    }
+
+    for h in sorted(heights, reverse=True):
+        label = quality_labels.get(h, f"{h}p")
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+
+        best = None
+        best_tbr = 0
+        for f in raw_formats:
+            if f.get("height") == h and f.get("vcodec", "none") != "none":
+                tbr = f.get("tbr") or 0
+                if tbr > best_tbr:
+                    best_tbr = tbr
+                    best = f
+
+        if best:
+            fid = best.get("format_id", "best")
+            filesize = best.get("filesize") or best.get("filesize_approx") or 0
+            formats.append({
+                "format_id": f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={h}]+bestaudio/best[height<={h}]",
+                "label": f"🎬 {label} — MP4",
+                "ext": "mp4",
+                "filesize": filesize,
+                "filesize_human": format_bytes(filesize),
+                "height": h,
+            })
+
+    audio_formats = []
+    for f in raw_formats:
+        vcodec = f.get("vcodec", "none")
+        acodec = f.get("acodec", "none")
+        if vcodec == "none" and acodec != "none":
+            abr = int(f.get("abr") or 0)
+            if abr > 0:
+                audio_formats.append((abr, f.get("format_id", "bestaudio")))
+
+    seen_abr = set()
+    for abr, fid in sorted(audio_formats, reverse=True):
+        if abr in seen_abr:
+            continue
+        seen_abr.add(abr)
+        formats.append({
+            "format_id": "bestaudio/best",
+            "label": f"🎵 Audio Only — {abr}kbps MP3",
+            "ext": "mp3",
+            "filesize": 0,
+            "filesize_human": "Unknown",
+            "height": 0,
+        })
+
+    formats.insert(0, {
+        "format_id": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "label": "⭐ Best Quality (auto)",
+        "ext": "mp4",
+        "filesize": info.get("filesize") or info.get("filesize_approx") or 0,
+        "filesize_human": format_bytes(info.get("filesize") or info.get("filesize_approx") or 0),
+        "height": 9999,
+    })
+
+    return formats
 
 
-# ── Models ────────────────────────────────────────────────────────────────────
 class InfoRequest(BaseModel):
     url: str
 
@@ -99,7 +180,7 @@ class InfoRequest(BaseModel):
 
 class DownloadRequest(BaseModel):
     url: str
-    format_id: str = "best"
+    format_id: str = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 
     @validator("url")
     def url_not_empty(cls, v):
@@ -109,18 +190,14 @@ class DownloadRequest(BaseModel):
 
     @validator("format_id")
     def safe_format(cls, v):
-        # Only allow safe characters to prevent injection
-        if not re.match(r'^[\w\+\-\.\[\]\(\)\/\,\s]+$', v):
+        if len(v) > 300:
             raise ValueError("Invalid format.")
         return v.strip()
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
-
 @app.get("/")
 async def root():
     return {"status": "ZapLoad API is running ⚡"}
-
 
 @app.get("/health")
 async def health():
@@ -128,171 +205,137 @@ async def health():
 
 
 @app.post("/info")
-@limiter.limit("10/minute")
+@limiter.limit("15/minute")
 async def get_info(request: Request, body: InfoRequest):
-    """
-    Returns video/file info: title, thumbnail, available formats, file size.
-    Also decides whether the file should be served via server or direct link.
-    """
     url = validate_url(body.url)
 
-    # ── Try yt-dlp first (handles YT, TikTok, Insta, etc.) ──────────────────
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "cookiefile": None,
-    }
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        opts = {**YDL_BASE}
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        formats = []
-        seen = set()
-        for f in (info.get("formats") or []):
-            height   = f.get("height")
-            ext      = f.get("ext", "mp4")
-            fid      = f.get("format_id", "")
-            abr      = f.get("abr")
-            vcodec   = f.get("vcodec", "none")
-            acodec   = f.get("acodec", "none")
-
-            if vcodec != "none" and height:
-                label = f"{height}p ({ext.upper()})"
-                key   = f"{height}p"
-            elif vcodec == "none" and acodec != "none":
-                label = f"Audio only ({int(abr or 0)}kbps {ext.upper()})"
-                key   = f"audio_{abr}"
-            else:
-                continue
-
-            if key in seen:
-                continue
-            seen.add(key)
-
-            filesize = f.get("filesize") or f.get("filesize_approx") or 0
-            formats.append({
-                "format_id": fid,
-                "label":     label,
-                "ext":       ext,
-                "filesize":  filesize,
-                "filesize_human": format_bytes(filesize) if filesize else "Unknown",
-            })
-
-        # Sort: highest quality first, audio last
-        formats.sort(key=lambda x: (
-            0 if "Audio" not in x["label"] else 1,
-            -(int(x["label"].split("p")[0]) if x["label"][0].isdigit() else 0)
-        ))
-
-        # Add a best-quality default
-        formats.insert(0, {
-            "format_id": "bestvideo+bestaudio/best",
-            "label":     "Best Quality (auto)",
-            "ext":       "mp4",
-            "filesize":  0,
-            "filesize_human": "Unknown",
-        })
-
+        formats = build_formats(info)
         total_size = info.get("filesize") or info.get("filesize_approx") or 0
         large = total_size > SIZE_THRESHOLD
 
         return {
-            "type":        "media",
-            "title":       info.get("title", "Unknown"),
-            "thumbnail":   info.get("thumbnail"),
-            "duration":    info.get("duration"),
-            "uploader":    info.get("uploader"),
-            "formats":     formats,
-            "filesize":    total_size,
-            "filesize_human": format_bytes(total_size) if total_size else "Unknown",
-            "large_file":  large,
+            "type": "media",
+            "title": info.get("title", "Unknown"),
+            "thumbnail": info.get("thumbnail"),
+            "duration": info.get("duration"),
+            "uploader": info.get("uploader"),
+            "formats": formats,
+            "filesize": total_size,
+            "filesize_human": format_bytes(total_size),
+            "large_file": large,
             "large_warning": f"Large file ({format_bytes(total_size)}) — your browser will download this directly" if large else None,
-            "direct_url":  url if large else None,
         }
 
-    except yt_dlp.utils.DownloadError:
-        pass  # Not a media URL — fall through to direct file handling
+    except yt_dlp.utils.DownloadError as e:
+        err = str(e).lower()
+        if any(x in err for x in ["sign in", "login", "private", "removed", "unavailable", "blocked"]):
+            raise HTTPException(status_code=400, detail="This video is private, removed, or requires login.")
+        pass
+    except Exception as e:
+        logger.error(f"yt-dlp error: {e}")
+        pass
 
-    # ── Direct file link (ZIP, RAR, EXE, ISO …) ─────────────────────────────
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
             head = await client.head(url)
             content_length = int(head.headers.get("content-length", 0))
             content_type   = head.headers.get("content-type", "application/octet-stream")
             final_url      = str(head.url)
 
-        if content_length > MAX_ALLOWED_BYTES:
+        if content_length > MAX_ALLOWED:
             raise HTTPException(status_code=400, detail="File exceeds 2 GB limit.")
 
         large = content_length > SIZE_THRESHOLD
         filename = final_url.split("/")[-1].split("?")[0] or "download"
+        ext = filename.split(".")[-1] if "." in filename else "file"
+
+        if ext in ["mp4", "mkv", "avi", "mov", "webm"]:
+            icon = "🎬"; label = f"Video File ({ext.upper()})"
+        elif ext in ["mp3", "m4a", "wav", "flac", "aac"]:
+            icon = "🎵"; label = f"Audio File ({ext.upper()})"
+        elif ext in ["zip", "rar", "7z", "tar", "gz"]:
+            icon = "📦"; label = f"Archive ({ext.upper()})"
+        else:
+            icon = "📁"; label = f"File ({ext.upper()})"
 
         return {
-            "type":        "direct",
-            "title":       filename,
-            "thumbnail":   None,
-            "formats":     [{"format_id": "direct", "label": "Direct Download", "ext": filename.split(".")[-1], "filesize": content_length, "filesize_human": format_bytes(content_length) if content_length else "Unknown"}],
-            "filesize":    content_length,
-            "filesize_human": format_bytes(content_length) if content_length else "Unknown",
-            "large_file":  large,
+            "type": "direct",
+            "title": filename,
+            "thumbnail": None,
+            "formats": [{
+                "format_id": "direct",
+                "label": f"⬇️ {label} — {format_bytes(content_length)}",
+                "ext": ext,
+                "filesize": content_length,
+                "filesize_human": format_bytes(content_length),
+            }],
+            "filesize": content_length,
+            "filesize_human": format_bytes(content_length),
+            "large_file": large,
             "large_warning": f"Large file ({format_bytes(content_length)}) — your browser will download this directly" if large else None,
-            "direct_url":  final_url,
-            "content_type": content_type,
+            "direct_url": final_url,
         }
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Info error | url={url} | {e}")
-        raise HTTPException(status_code=400, detail="Could not fetch file info. Check the URL and try again.")
+        logger.error(f"Direct file error | {e}")
+        raise HTTPException(status_code=400, detail="Could not fetch info. Please check the link and try again.")
 
 
 @app.post("/download")
 @limiter.limit("10/minute")
 async def download(request: Request, body: DownloadRequest):
-    """
-    For small files (< 500MB): streams file through our server.
-    For large files: returns the direct URL for browser to download.
-    """
     url       = validate_url(body.url)
     format_id = body.format_id
 
-    # ── Large / direct file: just redirect ──────────────────────────────────
     if format_id == "direct":
         return JSONResponse({"redirect": url})
 
-    # ── yt-dlp media download (small files only) ─────────────────────────────
+    tmp_dir = "/tmp"
     ydl_opts = {
-        "quiet":       True,
-        "no_warnings": True,
-        "format":      format_id,
-        # Use aria2c for parallel chunk downloading (IDM-style speed)
-        "external_downloader":      "aria2c",
-        "external_downloader_args": ["-x", "16", "-s", "16", "-k", "1M"],
-        "outtmpl":     "/tmp/zapload_%(id)s.%(ext)s",
+        **YDL_BASE,
+        "skip_download": False,
+        "format": format_id,
+        "outtmpl": f"{tmp_dir}/zapload_%(id)s.%(ext)s",
+        "merge_output_format": "mp4",
+        "postprocessors": [{
+            "key": "FFmpegVideoConvertor",
+            "preferedformat": "mp4",
+        }],
     }
+
+    try:
+        import subprocess
+        subprocess.run(["aria2c", "--version"], capture_output=True, check=True)
+        ydl_opts["external_downloader"] = "aria2c"
+        ydl_opts["external_downloader_args"] = ["-x", "16", "-s", "16", "-k", "1M"]
+    except Exception:
+        pass
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info     = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)
+            if not os.path.exists(filepath):
+                base = filepath.rsplit(".", 1)[0]
+                for ext in ["mp4", "mkv", "webm", "mp3", "m4a"]:
+                    candidate = f"{base}.{ext}"
+                    if os.path.exists(candidate):
+                        filepath = candidate
+                        break
 
         if not os.path.exists(filepath):
-            # yt-dlp sometimes changes extension
-            base = filepath.rsplit(".", 1)[0]
-            for ext in ["mp4", "mkv", "webm", "mp3", "m4a"]:
-                candidate = f"{base}.{ext}"
-                if os.path.exists(candidate):
-                    filepath = candidate
-                    break
+            raise HTTPException(status_code=500, detail="Download failed.")
 
         filesize = os.path.getsize(filepath)
-        if filesize > MAX_SERVER_BYTES:
+        if filesize > SIZE_THRESHOLD:
             os.remove(filepath)
-            return JSONResponse({
-                "redirect": url,
-                "warning":  "File too large to stream — downloading directly from source."
-            })
+            return JSONResponse({"redirect": url})
 
         filename = os.path.basename(filepath)
 
@@ -311,6 +354,8 @@ async def download(request: Request, body: DownloadRequest):
             headers={"Content-Disposition": f'attachment; filename="{filename}"'}
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Download error | url={url} | format={format_id} | {e}")
+        logger.error(f"Download error | {e}")
         raise HTTPException(status_code=500, detail="Download failed. Please try again.")
